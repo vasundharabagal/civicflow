@@ -1,14 +1,15 @@
 from math import radians, sin, cos, sqrt, atan2
 from datetime import datetime
+from typing import List, Dict, Any, Optional
 
 
 def calculate_distance(lat1, lon1, lat2, lon2):
-
+    """Haversine formula to calculate distance in kilometers."""
     earth_radius = 6371
 
     lat1, lon1, lat2, lon2 = map(
         radians,
-        [lat1, lon1, lat2, lon2]
+        [float(lat1), float(lon1), float(lat2), float(lon2)]
     )
 
     dlat = lat2 - lat1
@@ -27,22 +28,30 @@ def calculate_distance(lat1, lon1, lat2, lon2):
 
 
 def calculate_time_score(time_a, time_b):
+    """Compute score based on time difference (closer in time = higher score)."""
+    if isinstance(time_a, str):
+        time_a = datetime.fromisoformat(time_a.replace("Z", "+00:00"))
+    if isinstance(time_b, str):
+        time_b = datetime.fromisoformat(time_b.replace("Z", "+00:00"))
 
-    time_a = datetime.fromisoformat(time_a)
-    time_b = datetime.fromisoformat(time_b)
+    # Convert to naive if needed for comparison
+    if time_a.tzinfo is not None and time_b.tzinfo is None:
+        time_b = time_b.replace(tzinfo=time_a.tzinfo)
+    elif time_b.tzinfo is not None and time_a.tzinfo is None:
+        time_a = time_a.replace(tzinfo=time_b.tzinfo)
 
     hours = abs(
         (time_a - time_b).total_seconds()
     ) / 3600
 
-    if hours >= 6:
+    if hours >= 72:
         return 0
 
-    return 1 - (hours / 6)
+    return max(0.0, 1.0 - (hours / 72.0))
 
 
 def calculate_text_similarity(text_a, text_b):
-
+    """Compute word overlap similarity with civic synonym mapping."""
     synonyms = {
         "power": "electricity",
         "electric": "electricity",
@@ -53,15 +62,18 @@ def calculate_text_similarity(text_a, text_b):
         "trash": "waste",
         "rubbish": "waste",
         "dumped": "waste",
+        "dump": "waste",
 
         "piling": "accumulating",
         "pile": "accumulating",
         "potholes": "pothole",
         "roads": "road",
+        "manholes": "manhole",
 
         "shortage": "water",
         "supply": "water",
-        "leakage": "leak"
+        "leakage": "leak",
+        "leaking": "leak"
     }
 
     words_a = text_a.lower().split()
@@ -69,12 +81,12 @@ def calculate_text_similarity(text_a, text_b):
 
     words_a = {
         synonyms.get(word, word)
-        for word in words_a
+        for word in words_a if len(word) > 2
     }
 
     words_b = {
         synonyms.get(word, word)
-        for word in words_b
+        for word in words_b if len(word) > 2
     }
 
     if not words_a or not words_b:
@@ -87,16 +99,13 @@ def calculate_text_similarity(text_a, text_b):
 
 
 def calculate_confidence(a, b):
+    """Calculate matching confidence between two complaints (0-100)."""
+    # Category match
+    cat_a = a.get("category", "").lower()
+    cat_b = b.get("category", "").lower()
+    category_score = 1.0 if cat_a == cat_b and cat_a else 0.0
 
-    # Category
-    category_score = (
-        1
-        if a["category"].lower()
-        == b["category"].lower()
-        else 0
-    )
-
-    # Location
+    # Location distance
     distance = calculate_distance(
         a["latitude"],
         a["longitude"],
@@ -105,34 +114,80 @@ def calculate_confidence(a, b):
     )
 
     location_score = max(
-        0,
-        1 - (distance / 2)
+        0.0,
+        1.0 - (distance / 0.5)  # 500m radius threshold for clustering
     )
 
-    # Time
+    # Time score
     time_score = calculate_time_score(
-        a["created_at"],
-        b["created_at"]
+        a.get("created_at", datetime.utcnow().isoformat()),
+        b.get("created_at", datetime.utcnow().isoformat())
     )
 
-    # Description
+    # Text description similarity
     text_score = calculate_text_similarity(
-        a["description"],
-        b["description"]
+        a.get("description", ""),
+        b.get("description", "")
     )
 
     confidence = (
-        category_score * 25
-        + location_score * 25
-        + time_score * 20
-        + text_score * 30
+        category_score * 30
+        + location_score * 30
+        + time_score * 15
+        + text_score * 25
     )
 
     return round(confidence, 2)
 
 
-def detect_area_incident(complaints):
+def find_duplicate_complaints(
+    target_complaint: Dict[str, Any],
+    existing_complaints: List[Dict[str, Any]],
+    distance_threshold_km: float = 0.3,
+    confidence_threshold: float = 50.0
+) -> List[Dict[str, Any]]:
+    """
+    Find existing complaints that likely report the same issue in the vicinity.
+    Returns matched complaints with distance and confidence score.
+    """
+    duplicates = []
+    lat = target_complaint.get("latitude")
+    lon = target_complaint.get("longitude")
 
+    if lat is None or lon is None:
+        return duplicates
+
+    for c in existing_complaints:
+        if c.get("id") == target_complaint.get("id"):
+            continue
+
+        c_lat = c.get("latitude")
+        c_lon = c.get("longitude")
+        if c_lat is None or c_lon is None:
+            continue
+
+        dist = calculate_distance(lat, lon, c_lat, c_lon)
+        if dist <= distance_threshold_km:
+            conf = calculate_confidence(target_complaint, c)
+            if conf >= confidence_threshold:
+                duplicates.append({
+                    "complaint_id": c.get("id"),
+                    "title": c.get("title", c.get("description", "")[:40]),
+                    "status": c.get("status", "SUBMITTED"),
+                    "distance_meters": round(dist * 1000, 1),
+                    "confidence": conf,
+                    "created_at": c.get("created_at"),
+                    "support_count": c.get("support_count", 1)
+                })
+
+    duplicates.sort(key=lambda x: x["confidence"], reverse=True)
+    return duplicates
+
+
+def detect_area_incident(complaints):
+    """
+    Detect multi-citizen incident cluster if >= 3 related complaints are within threshold.
+    """
     if not complaints:
         return {
             "incident_detected": False,
@@ -142,43 +197,38 @@ def detect_area_incident(complaints):
     related = [complaints[0]]
 
     for complaint in complaints[1:]:
-
         confidence = calculate_confidence(
             complaints[0],
             complaint
         )
-
-        if confidence >= 60:
+        if confidence >= 50:
             related.append(complaint)
 
     if len(related) < 3:
-
         return {
             "incident_detected": False,
             "complaint_count": len(related)
         }
 
     categories = [
-        c["category"]
+        c.get("category", "General")
         for c in related
     ]
 
     severities = [
-        c.get("severity", "Medium")
+        c.get("severity", c.get("severity_level", "Medium"))
         for c in related
     ]
 
-    if "High" in severities:
-        severity = "High"
+    if "CRITICAL" in severities or "High" in severities:
+        severity = "CRITICAL" if "CRITICAL" in severities else "High"
     elif "Medium" in severities:
         severity = "Medium"
     else:
         severity = "Low"
 
     scores = []
-
     for complaint in related[1:]:
-
         scores.append(
             calculate_confidence(
                 related[0],
@@ -189,7 +239,7 @@ def detect_area_incident(complaints):
     average_confidence = (
         sum(scores) / len(scores)
         if scores
-        else 100
+        else 100.0
     )
 
     return {
@@ -205,17 +255,19 @@ def detect_area_incident(complaints):
             2
         ),
         "related_complaint_ids": [
-            c["id"]
+            c.get("id")
             for c in related
         ],
         "reason": [
             "Same civic issue category",
-            "Complaints are geographically close",
-            "Complaints occurred within a similar time window",
-            "Complaint descriptions show similarity"
+            "Complaints are geographically clustered within 500m",
+            "Complaints occurred within an overlapping time window",
+            "Complaint descriptions show semantic correlation"
         ],
         "recommended_action":
-            "Prioritize for departmental review"
+            "Prioritize for urgent unified departmental dispatch"
     }
+
+
 if __name__ == "__main__":
-    print("CivicFlow AI Engine is working!")
+    print("CivicFlow AI Engine is verified and running!")

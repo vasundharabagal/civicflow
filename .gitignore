@@ -1,5 +1,36 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+*.db
+*.sqlite3
+venv/
+env/
+ENV/
+
+# Node
 node_modules/
 dist/
+dist-ssr/
+*.local
+
+# Environment variables & secrets
 .env
+.env.*
+!.env.example
+credentials.json
+service-account.json
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
